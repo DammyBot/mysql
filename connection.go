@@ -40,6 +40,7 @@ type mysqlConn struct {
 	compressSequence uint8
 	parseTime        bool
 	compress         bool
+	connectionID     uint32
 
 	// for context support (Go 1.8+)
 	watching bool
@@ -217,7 +218,8 @@ func (mc *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 	}
 
 	stmt := &mysqlStmt{
-		mc: mc,
+		mc:  mc,
+		sql: query,
 	}
 
 	// Read Result
@@ -555,11 +557,18 @@ func (mc *mysqlConn) QueryContext(ctx context.Context, query string, args []driv
 		return nil, err
 	}
 
+	if len(dargs) != 0 && !mc.cfg.InterpolateParams {
+		return nil, driver.ErrSkip
+	}
+
+	ctx, startTime := mc.startTrace(ctx, query, mc.namedValueToAny(args), false)
 	rows, err := mc.query(query, dargs)
 	if err != nil {
+		mc.endTrace(ctx, startTime, err, nil)
 		mc.finish()
 		return nil, err
 	}
+	mc.endTrace(ctx, startTime, nil, &mc.result)
 	rows.finish = mc.finish
 	return rows, err
 }
@@ -575,7 +584,14 @@ func (mc *mysqlConn) ExecContext(ctx context.Context, query string, args []drive
 	}
 	defer mc.finish()
 
-	return mc.Exec(query, dargs)
+	if len(dargs) != 0 && !mc.cfg.InterpolateParams {
+		return nil, driver.ErrSkip
+	}
+
+	ctx, startTime := mc.startTrace(ctx, query, mc.namedValueToAny(args), false)
+	res, err := mc.Exec(query, dargs)
+	mc.endTrace(ctx, startTime, err, res)
+	return res, err
 }
 
 func (mc *mysqlConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
@@ -608,11 +624,14 @@ func (stmt *mysqlStmt) QueryContext(ctx context.Context, args []driver.NamedValu
 		return nil, err
 	}
 
+	ctx, startTime := stmt.mc.startTrace(ctx, stmt.sql, stmt.mc.namedValueToAny(args), true)
 	rows, err := stmt.query(dargs)
 	if err != nil {
+		stmt.mc.endTrace(ctx, startTime, err, nil)
 		stmt.mc.finish()
 		return nil, err
 	}
+	stmt.mc.endTrace(ctx, startTime, nil, &stmt.mc.result)
 	rows.finish = stmt.mc.finish
 	return rows, err
 }
@@ -628,7 +647,10 @@ func (stmt *mysqlStmt) ExecContext(ctx context.Context, args []driver.NamedValue
 	}
 	defer stmt.mc.finish()
 
-	return stmt.Exec(dargs)
+	ctx, startTime := stmt.mc.startTrace(ctx, stmt.sql, stmt.mc.namedValueToAny(args), true)
+	res, err := stmt.Exec(dargs)
+	stmt.mc.endTrace(ctx, startTime, err, res)
+	return res, err
 }
 
 func (mc *mysqlConn) watchCancel(ctx context.Context) error {
@@ -724,6 +746,46 @@ func (mc *mysqlConn) ResetSession(ctx context.Context) error {
 // (From Go 1.15)
 func (mc *mysqlConn) IsValid() bool {
 	return !mc.closed.Load() && !mc.buf.busy()
+}
+
+func (mc *mysqlConn) namedValueToAny(args []driver.NamedValue) []any {
+	if len(args) == 0 {
+		return nil
+	}
+	res := make([]any, len(args))
+	for i, arg := range args {
+		res[i] = any(arg.Value)
+	}
+	return res
+}
+
+func (mc *mysqlConn) startTrace(ctx context.Context, query string, args []any, isPrepared bool) (context.Context, time.Time) {
+	startTime := time.Now()
+	info := QueryInfo{
+		Query:        query,
+		Args:         args,
+		Database:     mc.cfg.DBName,
+		IsPrepared:   isPrepared,
+		ConnectionID: uint64(mc.connectionID),
+		StartTime:    startTime,
+	}
+	return mc.cfg.queryTracer.TraceQueryStart(ctx, info), startTime
+}
+
+func (mc *mysqlConn) endTrace(ctx context.Context, startTime time.Time, err error, res driver.Result) {
+	duration := time.Since(startTime)
+	var rowsAffected, lastInsertID int64
+	if res != nil {
+		rowsAffected, _ = res.RowsAffected()
+		lastInsertID, _ = res.LastInsertId()
+	}
+	result := QueryResult{
+		Duration:     duration,
+		Error:        err,
+		RowsAffected: rowsAffected,
+		LastInsertID: lastInsertID,
+	}
+	mc.cfg.queryTracer.TraceQueryEnd(ctx, result)
 }
 
 var _ driver.SessionResetter = &mysqlConn{}
