@@ -1,0 +1,861 @@
+diff --git a/connection.go b/connection.go
+index 5648e47..8944a84 100644
+--- a/connection.go
++++ b/connection.go
+@@ -21,6 +21,7 @@ import (
+ 	"strings"
+ 	"sync/atomic"
+ 	"time"
++	"unsafe"
+ )
+ 
+ type mysqlConn struct {
+@@ -65,6 +66,25 @@ func (mc *mysqlConn) log(v ...any) {
+ 	mc.cfg.Logger.Print(v...)
+ }
+ 
++// getConnectionID returns a unique identifier for this connection
++func (mc *mysqlConn) getConnectionID() uint64 {
++	// Use the memory address as a unique connection ID
++	// This is not the MySQL connection ID but serves as a unique identifier
++	return uint64(uintptr(unsafe.Pointer(mc))) / 16 // Reduce to reasonable size
++}
++
++// convertDriverValuesToAny converts driver.Value slice to []any
++func convertDriverValuesToAny(values []driver.Value) []any {
++	if values == nil {
++		return nil
++	}
++	result := make([]any, len(values))
++	for i, v := range values {
++		result[i] = v
++	}
++	return result
++}
++
+ func (mc *mysqlConn) readWithTimeout(b []byte) (int, error) {
+ 	to := mc.cfg.ReadTimeout
+ 	if to > 0 {
+@@ -555,12 +575,47 @@ func (mc *mysqlConn) QueryContext(ctx context.Context, query string, args []driv
+ 		return nil, err
+ 	}
+ 
++	// Trace query start
++	var traceCtx context.Context
++	var startTime time.Time
++	var queryInfo QueryInfo
++	if mc.cfg.tracer != nil {
++		startTime = time.Now()
++		queryInfo = QueryInfo{
++			Query:        query,
++			Args:         convertDriverValuesToAny(dargs),
++			Database:     mc.cfg.DBName,
++			IsPrepared:   false,
++			ConnectionID: mc.getConnectionID(),
++			StartTime:    startTime,
++		}
++		traceCtx = mc.cfg.tracer.TraceQueryStart(ctx, queryInfo)
++	}
++
+ 	rows, err := mc.query(query, dargs)
+ 	if err != nil {
+ 		mc.finish()
++		// Trace query end on error
++		if mc.cfg.tracer != nil {
++			queryResult := QueryResult{
++				Duration: time.Since(startTime),
++				Error:    err,
++			}
++			mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
++		}
+ 		return nil, err
+ 	}
+ 	rows.finish = mc.finish
++
++	// Trace query end on success
++	if mc.cfg.tracer != nil {
++		queryResult := QueryResult{
++			Duration: time.Since(startTime),
++			Error:    nil,
++		}
++		mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
++	}
++
+ 	return rows, err
+ }
+ 
+@@ -573,9 +628,48 @@ func (mc *mysqlConn) ExecContext(ctx context.Context, query string, args []drive
+ 	if err := mc.watchCancel(ctx); err != nil {
+ 		return nil, err
+ 	}
+-	defer mc.finish()
+ 
+-	return mc.Exec(query, dargs)
++	// Trace query start
++	var traceCtx context.Context
++	var startTime time.Time
++	if mc.cfg.tracer != nil {
++		startTime = time.Now()
++		queryInfo := QueryInfo{
++			Query:        query,
++			Args:         convertDriverValuesToAny(dargs),
++			Database:     mc.cfg.DBName,
++			IsPrepared:   false,
++			ConnectionID: mc.getConnectionID(),
++			StartTime:    startTime,
++		}
++		traceCtx = mc.cfg.tracer.TraceQueryStart(ctx, queryInfo)
++	}
++
++	result, err := mc.Exec(query, dargs)
++
++	// Trace query end
++	if mc.cfg.tracer != nil {
++		var rowsAffected, lastInsertID int64
++		if err == nil && result != nil {
++			if res, ok := result.(*mysqlResult); ok {
++				if len(res.affectedRows) > 0 {
++					rowsAffected = res.affectedRows[len(res.affectedRows)-1]
++				}
++				if len(res.insertIds) > 0 {
++					lastInsertID = res.insertIds[len(res.insertIds)-1]
++				}
++			}
++		}
++		queryResult := QueryResult{
++			Duration:     time.Since(startTime),
++			Error:        err,
++			RowsAffected: rowsAffected,
++			LastInsertID: lastInsertID,
++		}
++		mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
++	}
++
++	return result, err
+ }
+ 
+ func (mc *mysqlConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+@@ -608,12 +702,46 @@ func (stmt *mysqlStmt) QueryContext(ctx context.Context, args []driver.NamedValu
+ 		return nil, err
+ 	}
+ 
++	// Trace query start for prepared statement
++	var traceCtx context.Context
++	var startTime time.Time
++	if stmt.mc.cfg.tracer != nil {
++		startTime = time.Now()
++		queryInfo := QueryInfo{
++			Query:        "PREPARED_STATEMENT", // We don't have the original query here
++			Args:         convertDriverValuesToAny(dargs),
++			Database:     stmt.mc.cfg.DBName,
++			IsPrepared:   true,
++			ConnectionID: stmt.mc.getConnectionID(),
++			StartTime:    startTime,
++		}
++		traceCtx = stmt.mc.cfg.tracer.TraceQueryStart(ctx, queryInfo)
++	}
++
+ 	rows, err := stmt.query(dargs)
+ 	if err != nil {
+ 		stmt.mc.finish()
++		// Trace query end on error
++		if stmt.mc.cfg.tracer != nil {
++			queryResult := QueryResult{
++				Duration: time.Since(startTime),
++				Error:    err,
++			}
++			stmt.mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
++		}
+ 		return nil, err
+ 	}
+ 	rows.finish = stmt.mc.finish
++
++	// Trace query end on success
++	if stmt.mc.cfg.tracer != nil {
++		queryResult := QueryResult{
++			Duration: time.Since(startTime),
++			Error:    nil,
++		}
++		stmt.mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
++	}
++
+ 	return rows, err
+ }
+ 
+@@ -626,9 +754,48 @@ func (stmt *mysqlStmt) ExecContext(ctx context.Context, args []driver.NamedValue
+ 	if err := stmt.mc.watchCancel(ctx); err != nil {
+ 		return nil, err
+ 	}
+-	defer stmt.mc.finish()
+ 
+-	return stmt.Exec(dargs)
++	// Trace query start for prepared statement
++	var traceCtx context.Context
++	var startTime time.Time
++	if stmt.mc.cfg.tracer != nil {
++		startTime = time.Now()
++		queryInfo := QueryInfo{
++			Query:        "PREPARED_STATEMENT", // We don't have the original query here
++			Args:         convertDriverValuesToAny(dargs),
++			Database:     stmt.mc.cfg.DBName,
++			IsPrepared:   true,
++			ConnectionID: stmt.mc.getConnectionID(),
++			StartTime:    startTime,
++		}
++		traceCtx = stmt.mc.cfg.tracer.TraceQueryStart(ctx, queryInfo)
++	}
++
++	result, err := stmt.Exec(dargs)
++
++	// Trace query end
++	if stmt.mc.cfg.tracer != nil {
++		var rowsAffected, lastInsertID int64
++		if err == nil && result != nil {
++			if res, ok := result.(*mysqlResult); ok {
++				if len(res.affectedRows) > 0 {
++					rowsAffected = res.affectedRows[len(res.affectedRows)-1]
++				}
++				if len(res.insertIds) > 0 {
++					lastInsertID = res.insertIds[len(res.insertIds)-1]
++				}
++			}
++		}
++		queryResult := QueryResult{
++			Duration:     time.Since(startTime),
++			Error:        err,
++			RowsAffected: rowsAffected,
++			LastInsertID: lastInsertID,
++		}
++		stmt.mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
++	}
++
++	return result, err
+ }
+ 
+ func (mc *mysqlConn) watchCancel(ctx context.Context) error {
+diff --git a/dsn.go b/dsn.go
+index 89556bf..ab1a974 100644
+--- a/dsn.go
++++ b/dsn.go
+@@ -81,6 +81,7 @@ type Config struct {
+ 	pubKey        *rsa.PublicKey                       // Server public key
+ 	timeTruncate  time.Duration                        // Truncate time.Time values to the specified duration
+ 	charsets      []string                             // Connection charset. When set, this will be set in SET NAMES <charset> query
++	tracer        QueryTracer                          // Query tracer for logging and monitoring
+ }
+ 
+ // Functional Options Pattern
+@@ -167,6 +168,8 @@ func (cfg *Config) Clone() *Config {
+ 			E: cfg.pubKey.E,
+ 		}
+ 	}
++	// Clone the tracer if it exists
++	cp.tracer = cfg.tracer
+ 	return &cp
+ }
+ 
+diff --git a/tracer.go b/tracer.go
+new file mode 100644
+index 0000000..cd3e417
+--- /dev/null
++++ b/tracer.go
+@@ -0,0 +1,81 @@
++// Go MySQL Driver - Query Tracer Implementation
++//
++// Copyright 2024 The Go-MySQL-Driver Authors. All rights reserved.
++//
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at http://mozilla.org/MPL/2.0.
++
++package mysql
++
++import (
++	"context"
++	"time"
++)
++
++// QueryTracer interface for SQL query logging and monitoring
++type QueryTracer interface {
++	// TraceQueryStart is called when a query is about to be executed
++	TraceQueryStart(context.Context, QueryInfo) context.Context
++
++	// TraceQueryEnd is called when a query has completed execution
++	TraceQueryEnd(context.Context, QueryResult)
++}
++
++// QueryInfo contains information about a query being executed
++type QueryInfo struct {
++	Query        string    // The SQL query being executed
++	Args         []any     // Query arguments
++	Database     string    // Database name
++	IsPrepared   bool      // Whether this is a prepared statement execution
++	ConnectionID uint64    // Connection ID
++	StartTime    time.Time // When the query started
++}
++
++// QueryResult contains the result of query execution
++type QueryResult struct {
++	Duration     time.Duration // Query execution duration
++	Error        error         // Error from query execution (nil if successful)
++	RowsAffected int64         // Number of rows affected
++	LastInsertID int64         // Last insert ID (for INSERT queries)
++}
++
++// NoopTracer is an empty implementation of QueryTracer that does nothing
++type NoopTracer struct{}
++
++// TraceQueryStart implements QueryTracer interface (no-op)
++func (NoopTracer) TraceQueryStart(ctx context.Context, _ QueryInfo) context.Context {
++	return ctx
++}
++
++// TraceQueryEnd implements QueryTracer interface (no-op)
++func (NoopTracer) TraceQueryEnd(_ context.Context, _ QueryResult) {}
++
++// FuncTracer is a callback-based implementation of QueryTracer
++type FuncTracer struct {
++	OnStart func(context.Context, QueryInfo) context.Context
++	OnEnd   func(context.Context, QueryResult)
++}
++
++// TraceQueryStart implements QueryTracer interface with nil-safe callback
++func (ft FuncTracer) TraceQueryStart(ctx context.Context, info QueryInfo) context.Context {
++	if ft.OnStart != nil {
++		return ft.OnStart(ctx, info)
++	}
++	return ctx
++}
++
++// TraceQueryEnd implements QueryTracer interface with nil-safe callback
++func (ft FuncTracer) TraceQueryEnd(ctx context.Context, result QueryResult) {
++	if ft.OnEnd != nil {
++		ft.OnEnd(ctx, result)
++	}
++}
++
++// TracerOption creates a functional option to configure a QueryTracer
++func TracerOption(tracer QueryTracer) Option {
++	return func(cfg *Config) error {
++		cfg.tracer = tracer
++		return nil
++	}
++}
+diff --git a/tracer_test.go b/tracer_test.go
+new file mode 100644
+index 0000000..5cf729a
+--- /dev/null
++++ b/tracer_test.go
+@@ -0,0 +1,512 @@
++// Go MySQL Driver - Query Tracer Tests
++//
++// Copyright 2024 The Go-MySQL-Driver Authors. All rights reserved.
++//
++// This Source Code Form is subject to the terms of the Mozilla Public
++// License, v. 2.0. If a copy of the MPL was not distributed with this file,
++// You can obtain one at http://mozilla.org/MPL/2.0.
++
++//go:build tracer
++
++package mysql
++
++import (
++	"context"
++	"sync"
++	"testing"
++	"time"
++
++	"database/sql/driver"
++)
++
++// TestNoopTracer verifies that NoopTracer is a working no-op implementation
++func TestNoopTracer(t *testing.T) {
++	tracer := NoopTracer{}
++
++	ctx := context.Background()
++	info := QueryInfo{
++		Query:        "SELECT 1",
++		Args:         []any{1, "test"},
++		Database:     "testdb",
++		IsPrepared:   false,
++		ConnectionID: 123,
++		StartTime:    time.Now(),
++	}
++
++	// TraceQueryStart should return the same context
++	newCtx := tracer.TraceQueryStart(ctx, info)
++	if newCtx != ctx {
++		t.Errorf("NoopTracer should return the same context, got different context")
++	}
++
++	// TraceQueryEnd should not panic
++	result := QueryResult{
++		Duration:     time.Second,
++		Error:        nil,
++		RowsAffected: 1,
++		LastInsertID: 100,
++	}
++
++	// This should not panic
++	tracer.TraceQueryEnd(newCtx, result)
++}
++
++// TestFuncTracerNilCallbacks verifies that FuncTracer handles nil callbacks safely
++func TestFuncTracerNilCallbacks(t *testing.T) {
++	tracer := FuncTracer{}
++
++	ctx := context.Background()
++	info := QueryInfo{
++		Query:        "SELECT 1",
++		Args:         []any{1, "test"},
++		Database:     "testdb",
++		IsPrepared:   false,
++		ConnectionID: 123,
++		StartTime:    time.Now(),
++	}
++
++	// Should not panic with nil OnStart
++	newCtx := tracer.TraceQueryStart(ctx, info)
++	if newCtx != ctx {
++		t.Errorf("FuncTracer with nil OnStart should return the same context")
++	}
++
++	result := QueryResult{
++		Duration:     time.Second,
++		Error:        nil,
++		RowsAffected: 1,
++		LastInsertID: 100,
++	}
++
++	// Should not panic with nil OnEnd
++	tracer.TraceQueryEnd(newCtx, result)
++}
++
++// TestFuncTracerWithCallbacks verifies that FuncTracer calls the callbacks correctly
++func TestFuncTracerWithCallbacks(t *testing.T) {
++	var startCalled, endCalled bool
++	var capturedInfo QueryInfo
++	var capturedResult QueryResult
++
++	tracer := FuncTracer{
++		OnStart: func(ctx context.Context, info QueryInfo) context.Context {
++			startCalled = true
++			capturedInfo = info
++			// Add a value to the context to test propagation
++			return context.WithValue(ctx, "test-key", "test-value")
++		},
++		OnEnd: func(ctx context.Context, result QueryResult) {
++			endCalled = true
++			capturedResult = result
++			// Verify context propagation
++			if val := ctx.Value("test-key"); val != "test-value" {
++				t.Errorf("Context not propagated correctly, got: %v", val)
++			}
++		},
++	}
++
++	ctx := context.Background()
++	info := QueryInfo{
++		Query:        "SELECT 1",
++		Args:         []any{1, "test"},
++		Database:     "testdb",
++		IsPrepared:   false,
++		ConnectionID: 123,
++		StartTime:    time.Now(),
++	}
++
++	newCtx := tracer.TraceQueryStart(ctx, info)
++	if !startCalled {
++		t.Error("OnStart callback should be called")
++	}
++	// Verify that the captured info has the expected values
++	if capturedInfo.Query != info.Query {
++		t.Error("QueryInfo.Query should be captured correctly")
++	}
++	if capturedInfo.Database != info.Database {
++		t.Error("QueryInfo.Database should be captured correctly")
++	}
++	if capturedInfo.IsPrepared != info.IsPrepared {
++		t.Error("QueryInfo.IsPrepared should be captured correctly")
++	}
++	if newCtx == ctx {
++		t.Error("Context should be modified by callback")
++	}
++
++	result := QueryResult{
++		Duration:     time.Second,
++		Error:        nil,
++		RowsAffected: 1,
++		LastInsertID: 100,
++	}
++
++	tracer.TraceQueryEnd(newCtx, result)
++	if !endCalled {
++		t.Error("OnEnd callback should be called")
++	}
++	// Verify that the captured result has the expected values
++	if capturedResult.Duration != result.Duration {
++		t.Error("QueryResult.Duration should be captured correctly")
++	}
++	if capturedResult.Error != result.Error {
++		t.Error("QueryResult.Error should be captured correctly")
++	}
++}
++
++// TestQueryTracerIntegration tests the tracer integration with actual query execution
++func TestQueryTracerIntegration(t *testing.T) {
++	if !available {
++		t.Skip("MySQL server not available")
++	}
++
++	var startCalls, endCalls int
++	var capturedQueries []string
++	var mu sync.Mutex
++
++	tracer := FuncTracer{
++		OnStart: func(ctx context.Context, info QueryInfo) context.Context {
++			mu.Lock()
++			defer mu.Unlock()
++			startCalls++
++			capturedQueries = append(capturedQueries, info.Query)
++			return ctx
++		},
++		OnEnd: func(ctx context.Context, result QueryResult) {
++			mu.Lock()
++			defer mu.Unlock()
++			endCalls++
++		},
++	}
++
++	// Create config with tracer
++	cfg := NewConfig()
++	cfg.User = user
++	cfg.Passwd = pass
++	cfg.Net = prot
++	cfg.Addr = addr
++	cfg.DBName = dbname
++
++	err := cfg.Apply(TracerOption(tracer))
++	if err != nil {
++		t.Fatalf("TracerOption should work: %v", err)
++	}
++
++	// Create connection
++	conn, err := NewConnector(cfg)
++	if err != nil {
++		t.Fatalf("NewConnector should work: %v", err)
++	}
++
++	dbConn, err := conn.Connect(context.Background())
++	if err != nil {
++		t.Fatalf("Connect should work: %v", err)
++	}
++	defer dbConn.Close()
++
++	mc, ok := dbConn.(*mysqlConn)
++	if !ok {
++		t.Fatal("Connection should be *mysqlConn")
++	}
++
++	// Test QueryContext
++	_, err = mc.QueryContext(context.Background(), "SELECT 1", nil)
++	if err != nil {
++		t.Fatalf("QueryContext should work: %v", err)
++	}
++
++	// Test ExecContext
++	_, err = mc.ExecContext(context.Background(), "CREATE TABLE IF NOT EXISTS test_tracer (id INT)", nil)
++	if err != nil {
++		t.Fatalf("ExecContext should work: %v", err)
++	}
++
++	_, err = mc.ExecContext(context.Background(), "INSERT INTO test_tracer (id) VALUES (1)", nil)
++	if err != nil {
++		t.Fatalf("ExecContext INSERT should work: %v", err)
++	}
++
++	// Test prepared statement
++	stmt, err := mc.PrepareContext(context.Background(), "SELECT * FROM test_tracer WHERE id = ?")
++	if err != nil {
++		t.Fatalf("PrepareContext should work: %v", err)
++	}
++
++	// Convert to *mysqlStmt to access QueryContext and ExecContext methods
++	mysqlStmt, ok := stmt.(*mysqlStmt)
++	if !ok {
++		t.Fatal("Statement should be *mysqlStmt")
++	}
++
++	_, err = mysqlStmt.QueryContext(context.Background(), []driver.NamedValue{{
++		Name:    "id",
++		Ordinal: 1,
++		Value:   int64(1),
++	}})
++	if err != nil {
++		t.Fatalf("Prepared statement QueryContext should work: %v", err)
++	}
++
++	_, err = mysqlStmt.ExecContext(context.Background(), []driver.NamedValue{{
++		Name:    "id",
++		Ordinal: 1,
++		Value:   int64(1),
++	}})
++	if err != nil {
++		t.Fatalf("Prepared statement ExecContext should work: %v", err)
++	}
++
++	// Clean up
++	_, err = mc.ExecContext(context.Background(), "DROP TABLE IF EXISTS test_tracer", nil)
++	if err != nil {
++		t.Fatalf("Cleanup should work: %v", err)
++	}
++
++	// Verify tracer was called
++	mu.Lock()
++	defer mu.Unlock()
++
++	if startCalls <= 0 {
++		t.Error("TraceQueryStart should be called")
++	}
++	if endCalls <= 0 {
++		t.Error("TraceQueryEnd should be called")
++	}
++	if startCalls != endCalls {
++		t.Errorf("Start and end calls should match, got %d start and %d end", startCalls, endCalls)
++	}
++
++	hasRegularQuery := false
++	hasPreparedQuery := false
++	for _, query := range capturedQueries {
++		if query == "SELECT 1" {
++			hasRegularQuery = true
++		}
++		if query == "PREPARED_STATEMENT" {
++			hasPreparedQuery = true
++		}
++	}
++
++	if !hasRegularQuery {
++		t.Error("Should capture regular queries")
++	}
++	if !hasPreparedQuery {
++		t.Error("Should capture prepared statements")
++	}
++}
++
++// TestQueryTracerErrorHandling tests that errors are properly captured by the tracer
++func TestQueryTracerErrorHandling(t *testing.T) {
++	if !available {
++		t.Skip("MySQL server not available")
++	}
++
++	var capturedErrors []error
++	var mu sync.Mutex
++
++	tracer := FuncTracer{
++		OnEnd: func(ctx context.Context, result QueryResult) {
++			mu.Lock()
++			defer mu.Unlock()
++			if result.Error != nil {
++				capturedErrors = append(capturedErrors, result.Error)
++			}
++		},
++	}
++
++	// Create config with tracer
++	cfg := NewConfig()
++	cfg.User = user
++	cfg.Passwd = pass
++	cfg.Net = prot
++	cfg.Addr = addr
++	cfg.DBName = dbname
++
++	err := cfg.Apply(TracerOption(tracer))
++	if err != nil {
++		t.Fatalf("TracerOption should work: %v", err)
++	}
++
++	// Create connection
++	conn, err := NewConnector(cfg)
++	if err != nil {
++		t.Fatalf("NewConnector should work: %v", err)
++	}
++
++	dbConn, err := conn.Connect(context.Background())
++	if err != nil {
++		t.Fatalf("Connect should work: %v", err)
++	}
++	defer dbConn.Close()
++
++	mc, ok := dbConn.(*mysqlConn)
++	if !ok {
++		t.Fatal("Connection should be *mysqlConn")
++	}
++
++	// Test with invalid query to trigger error
++	_, err = mc.QueryContext(context.Background(), "INVALID SQL QUERY", nil)
++	if err == nil {
++		t.Fatal("Invalid query should return error")
++	}
++
++	mu.Lock()
++	defer mu.Unlock()
++
++	if len(capturedErrors) == 0 {
++		t.Error("Tracer should capture errors")
++	}
++	if capturedErrors[0] != err {
++		t.Errorf("Captured error should match original error, got %v, want %v", capturedErrors[0], err)
++	}
++}
++
++// TestQueryTracerConcurrent tests that the tracer is thread-safe
++func TestQueryTracerConcurrent(t *testing.T) {
++	if !available {
++		t.Skip("MySQL server not available")
++	}
++
++	var startCalls, endCalls int
++	var mu sync.Mutex
++
++	tracer := FuncTracer{
++		OnStart: func(ctx context.Context, info QueryInfo) context.Context {
++			mu.Lock()
++			defer mu.Unlock()
++			startCalls++
++			return ctx
++		},
++		OnEnd: func(ctx context.Context, result QueryResult) {
++			mu.Lock()
++			defer mu.Unlock()
++			endCalls++
++		},
++	}
++
++	// Create config with tracer
++	cfg := NewConfig()
++	cfg.User = user
++	cfg.Passwd = pass
++	cfg.Net = prot
++	cfg.Addr = addr
++	cfg.DBName = dbname
++
++	err := cfg.Apply(TracerOption(tracer))
++	if err != nil {
++		t.Fatalf("TracerOption should work: %v", err)
++	}
++
++	// Create connection
++	conn, err := NewConnector(cfg)
++	if err != nil {
++		t.Fatalf("NewConnector should work: %v", err)
++	}
++
++	dbConn, err := conn.Connect(context.Background())
++	if err != nil {
++		t.Fatalf("Connect should work: %v", err)
++	}
++	defer dbConn.Close()
++
++	mc, ok := dbConn.(*mysqlConn)
++	if !ok {
++		t.Fatal("Connection should be *mysqlConn")
++	}
++
++	// Create table for testing
++	_, err = mc.ExecContext(context.Background(), "CREATE TABLE IF NOT EXISTS test_concurrent (id INT)", nil)
++	if err != nil {
++		t.Fatalf("Setup should work: %v", err)
++	}
++	defer func() {
++		_, _ = mc.ExecContext(context.Background(), "DROP TABLE IF EXISTS test_concurrent", nil)
++	}()
++
++	// Run concurrent queries
++	var wg sync.WaitGroup
++	numQueries := 10
++
++	for i := 0; i < numQueries; i++ {
++		wg.Add(1)
++		go func(id int) {
++			defer wg.Done()
++			_, err := mc.QueryContext(context.Background(), "SELECT ?", []driver.NamedValue{{
++				Ordinal: 1,
++				Value:   id,
++			}})
++			if err != nil {
++				t.Errorf("Concurrent query should work: %v", err)
++			}
++		}(i)
++	}
++
++	wg.Wait()
++
++	// Verify all tracer calls were made
++	mu.Lock()
++	defer mu.Unlock()
++
++	if startCalls != numQueries {
++		t.Errorf("All start calls should be made, got %d, want %d", startCalls, numQueries)
++	}
++	if endCalls != numQueries {
++		t.Errorf("All end calls should be made, got %d, want %d", endCalls, numQueries)
++	}
++	if startCalls != endCalls {
++		t.Errorf("Start and end calls should match, got %d start and %d end", startCalls, endCalls)
++	}
++}
++
++// TestQueryTracerContextPropagation tests that context is properly propagated
++func TestQueryTracerContextPropagation(t *testing.T) {
++	tracer := FuncTracer{
++		OnStart: func(ctx context.Context, info QueryInfo) context.Context {
++			// Add a value to the context
++			return context.WithValue(ctx, "test-key", "test-value")
++		},
++		OnEnd: func(ctx context.Context, result QueryResult) {
++			// Verify the context value is present
++			if val := ctx.Value("test-key"); val != "test-value" {
++				t.Errorf("Context not propagated correctly, got: %v", val)
++			}
++		},
++	}
++
++	ctx := context.Background()
++	info := QueryInfo{
++		Query:        "SELECT 1",
++		Args:         nil,
++		Database:     "testdb",
++		IsPrepared:   false,
++		ConnectionID: 123,
++		StartTime:    time.Now(),
++	}
++
++	newCtx := tracer.TraceQueryStart(ctx, info)
++
++	result := QueryResult{
++		Duration:     time.Second,
++		Error:        nil,
++		RowsAffected: 1,
++		LastInsertID: 100,
++	}
++
++	tracer.TraceQueryEnd(newCtx, result)
++	// If we get here without panic, the test passed
++}
++
++// TestTracerOptionNilTracer tests that TracerOption handles nil tracer gracefully
++func TestTracerOptionNilTracer(t *testing.T) {
++	cfg := NewConfig()
++
++	// Should not panic with nil tracer
++	err := cfg.Apply(TracerOption(nil))
++	if err != nil {
++		t.Errorf("TracerOption with nil tracer should not error: %v", err)
++	}
++
++	// Verify tracer is nil
++	if cfg.tracer != nil {
++		t.Error("Tracer should be nil")
++	}
++}

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unsafe"
 )
 
 type mysqlConn struct {
@@ -63,6 +64,25 @@ func (mc *mysqlConn) log(v ...any) {
 	}
 
 	mc.cfg.Logger.Print(v...)
+}
+
+// getConnectionID returns a unique identifier for this connection
+func (mc *mysqlConn) getConnectionID() uint64 {
+	// Use the memory address as a unique connection ID
+	// This is not the MySQL connection ID but serves as a unique identifier
+	return uint64(uintptr(unsafe.Pointer(mc))) / 16 // Reduce to reasonable size
+}
+
+// convertDriverValuesToAny converts driver.Value slice to []any
+func convertDriverValuesToAny(values []driver.Value) []any {
+	if values == nil {
+		return nil
+	}
+	result := make([]any, len(values))
+	for i, v := range values {
+		result[i] = v
+	}
+	return result
 }
 
 func (mc *mysqlConn) readWithTimeout(b []byte) (int, error) {
@@ -555,12 +575,47 @@ func (mc *mysqlConn) QueryContext(ctx context.Context, query string, args []driv
 		return nil, err
 	}
 
+	// Trace query start
+	var traceCtx context.Context
+	var startTime time.Time
+	var queryInfo QueryInfo
+	if mc.cfg.tracer != nil {
+		startTime = time.Now()
+		queryInfo = QueryInfo{
+			Query:        query,
+			Args:         convertDriverValuesToAny(dargs),
+			Database:     mc.cfg.DBName,
+			IsPrepared:   false,
+			ConnectionID: mc.getConnectionID(),
+			StartTime:    startTime,
+		}
+		traceCtx = mc.cfg.tracer.TraceQueryStart(ctx, queryInfo)
+	}
+
 	rows, err := mc.query(query, dargs)
 	if err != nil {
 		mc.finish()
+		// Trace query end on error
+		if mc.cfg.tracer != nil {
+			queryResult := QueryResult{
+				Duration: time.Since(startTime),
+				Error:    err,
+			}
+			mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
+		}
 		return nil, err
 	}
 	rows.finish = mc.finish
+
+	// Trace query end on success
+	if mc.cfg.tracer != nil {
+		queryResult := QueryResult{
+			Duration: time.Since(startTime),
+			Error:    nil,
+		}
+		mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
+	}
+
 	return rows, err
 }
 
@@ -573,9 +628,48 @@ func (mc *mysqlConn) ExecContext(ctx context.Context, query string, args []drive
 	if err := mc.watchCancel(ctx); err != nil {
 		return nil, err
 	}
-	defer mc.finish()
 
-	return mc.Exec(query, dargs)
+	// Trace query start
+	var traceCtx context.Context
+	var startTime time.Time
+	if mc.cfg.tracer != nil {
+		startTime = time.Now()
+		queryInfo := QueryInfo{
+			Query:        query,
+			Args:         convertDriverValuesToAny(dargs),
+			Database:     mc.cfg.DBName,
+			IsPrepared:   false,
+			ConnectionID: mc.getConnectionID(),
+			StartTime:    startTime,
+		}
+		traceCtx = mc.cfg.tracer.TraceQueryStart(ctx, queryInfo)
+	}
+
+	result, err := mc.Exec(query, dargs)
+
+	// Trace query end
+	if mc.cfg.tracer != nil {
+		var rowsAffected, lastInsertID int64
+		if err == nil && result != nil {
+			if res, ok := result.(*mysqlResult); ok {
+				if len(res.affectedRows) > 0 {
+					rowsAffected = res.affectedRows[len(res.affectedRows)-1]
+				}
+				if len(res.insertIds) > 0 {
+					lastInsertID = res.insertIds[len(res.insertIds)-1]
+				}
+			}
+		}
+		queryResult := QueryResult{
+			Duration:     time.Since(startTime),
+			Error:        err,
+			RowsAffected: rowsAffected,
+			LastInsertID: lastInsertID,
+		}
+		mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
+	}
+
+	return result, err
 }
 
 func (mc *mysqlConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
@@ -608,12 +702,46 @@ func (stmt *mysqlStmt) QueryContext(ctx context.Context, args []driver.NamedValu
 		return nil, err
 	}
 
+	// Trace query start for prepared statement
+	var traceCtx context.Context
+	var startTime time.Time
+	if stmt.mc.cfg.tracer != nil {
+		startTime = time.Now()
+		queryInfo := QueryInfo{
+			Query:        "PREPARED_STATEMENT", // We don't have the original query here
+			Args:         convertDriverValuesToAny(dargs),
+			Database:     stmt.mc.cfg.DBName,
+			IsPrepared:   true,
+			ConnectionID: stmt.mc.getConnectionID(),
+			StartTime:    startTime,
+		}
+		traceCtx = stmt.mc.cfg.tracer.TraceQueryStart(ctx, queryInfo)
+	}
+
 	rows, err := stmt.query(dargs)
 	if err != nil {
 		stmt.mc.finish()
+		// Trace query end on error
+		if stmt.mc.cfg.tracer != nil {
+			queryResult := QueryResult{
+				Duration: time.Since(startTime),
+				Error:    err,
+			}
+			stmt.mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
+		}
 		return nil, err
 	}
 	rows.finish = stmt.mc.finish
+
+	// Trace query end on success
+	if stmt.mc.cfg.tracer != nil {
+		queryResult := QueryResult{
+			Duration: time.Since(startTime),
+			Error:    nil,
+		}
+		stmt.mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
+	}
+
 	return rows, err
 }
 
@@ -626,9 +754,48 @@ func (stmt *mysqlStmt) ExecContext(ctx context.Context, args []driver.NamedValue
 	if err := stmt.mc.watchCancel(ctx); err != nil {
 		return nil, err
 	}
-	defer stmt.mc.finish()
 
-	return stmt.Exec(dargs)
+	// Trace query start for prepared statement
+	var traceCtx context.Context
+	var startTime time.Time
+	if stmt.mc.cfg.tracer != nil {
+		startTime = time.Now()
+		queryInfo := QueryInfo{
+			Query:        "PREPARED_STATEMENT", // We don't have the original query here
+			Args:         convertDriverValuesToAny(dargs),
+			Database:     stmt.mc.cfg.DBName,
+			IsPrepared:   true,
+			ConnectionID: stmt.mc.getConnectionID(),
+			StartTime:    startTime,
+		}
+		traceCtx = stmt.mc.cfg.tracer.TraceQueryStart(ctx, queryInfo)
+	}
+
+	result, err := stmt.Exec(dargs)
+
+	// Trace query end
+	if stmt.mc.cfg.tracer != nil {
+		var rowsAffected, lastInsertID int64
+		if err == nil && result != nil {
+			if res, ok := result.(*mysqlResult); ok {
+				if len(res.affectedRows) > 0 {
+					rowsAffected = res.affectedRows[len(res.affectedRows)-1]
+				}
+				if len(res.insertIds) > 0 {
+					lastInsertID = res.insertIds[len(res.insertIds)-1]
+				}
+			}
+		}
+		queryResult := QueryResult{
+			Duration:     time.Since(startTime),
+			Error:        err,
+			RowsAffected: rowsAffected,
+			LastInsertID: lastInsertID,
+		}
+		stmt.mc.cfg.tracer.TraceQueryEnd(traceCtx, queryResult)
+	}
+
+	return result, err
 }
 
 func (mc *mysqlConn) watchCancel(ctx context.Context) error {
