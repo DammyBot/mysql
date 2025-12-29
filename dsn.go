@@ -81,6 +81,7 @@ type Config struct {
 	pubKey        *rsa.PublicKey                       // Server public key
 	timeTruncate  time.Duration                        // Truncate time.Time values to the specified duration
 	charsets      []string                             // Connection charset. When set, this will be set in SET NAMES <charset> query
+	tracer        QueryTracer                          // Query tracer for logging and monitoring
 }
 
 // Functional Options Pattern
@@ -167,6 +168,8 @@ func (cfg *Config) Clone() *Config {
 			E: cfg.pubKey.E,
 		}
 	}
+	// Clone the tracer if it exists
+	cp.tracer = cfg.tracer
 	return &cp
 }
 
