@@ -19,6 +19,7 @@ import (
 type mysqlStmt struct {
 	mc         *mysqlConn
 	id         uint32
+	sql        string
 	paramCount int
 	columns    []mysqlField
 }

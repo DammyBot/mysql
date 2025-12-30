@@ -77,6 +77,8 @@ type Config struct {
 
 	compress bool // Enable zlib compression
 
+	queryTracer QueryTracer // SQL query tracer
+
 	beforeConnect func(context.Context, *Config) error // Invoked before a connection is established
 	pubKey        *rsa.PublicKey                       // Server public key
 	timeTruncate  time.Duration                        // Truncate time.Time values to the specified duration
@@ -95,6 +97,7 @@ func NewConfig() *Config {
 		Logger:               defaultLogger,
 		AllowNativePasswords: true,
 		CheckConnLiveness:    true,
+		queryTracer:          NoopTracer{},
 	}
 	return cfg
 }
@@ -131,6 +134,14 @@ func BeforeConnect(fn func(context.Context, *Config) error) Option {
 func EnableCompression(yes bool) Option {
 	return func(cfg *Config) error {
 		cfg.compress = yes
+		return nil
+	}
+}
+
+// TracerOption sets the query tracer.
+func TracerOption(tracer QueryTracer) Option {
+	return func(cfg *Config) error {
+		cfg.queryTracer = tracer
 		return nil
 	}
 }
@@ -229,6 +240,10 @@ func (cfg *Config) normalize() error {
 
 	if cfg.Logger == nil {
 		cfg.Logger = defaultLogger
+	}
+
+	if cfg.queryTracer == nil {
+		cfg.queryTracer = NoopTracer{}
 	}
 
 	return nil
